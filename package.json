@@ -282,7 +282,8 @@
     "publish:vsce": "vsce publish",
     "publish": "bun run package && bun run publish:vsce && bun run publish:ovsx",
     "test": "bun run build --sourcemap && vscode-tmgrammar-snap 'syntax-tests/*.nix'",
-    "full-test": "vscode-test",
+    "build:test": "bun build src/extension.test.ts --outdir=out --external=vscode --target=node --format=cjs",
+    "full-test": "bun run build && bun run build:test && vscode-test",
     "pretest": "bun x biome check --write src"
   },
   "dependencies": {
