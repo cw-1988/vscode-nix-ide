@@ -4,8 +4,8 @@ import { inspect } from "node:util";
 import { sync as commandExistsSync } from "command-exists";
 import {
   type Disposable,
-  type ExtensionContext,
   env,
+  type LogOutputChannel,
   Uri,
   window,
   workspace,
@@ -25,7 +25,11 @@ import {
 import { config, type UriMessageItem } from "./configuration";
 
 class Client extends LanguageClient {
-  disposables: Disposable[] = [];
+  private readonly resources: Disposable[] = [];
+
+  addResources(...resources: Disposable[]): void {
+    this.resources.push(...resources);
+  }
 
   override handleFailedRequest<T>(
     type: MessageSignature,
@@ -49,26 +53,19 @@ class Client extends LanguageClient {
     );
   }
 
-  override dispose(timeout?: number): Promise<void> {
-    let timedOut = false;
-    if (timeout) {
-      setTimeout(() => {
-        timedOut = true;
-      }, timeout);
-    }
-
-    for (const disposable of this.disposables) {
-      if (timedOut) {
-        break;
+  override async dispose(timeout?: number): Promise<void> {
+    try {
+      await super.dispose(timeout);
+    } finally {
+      for (const resource of this.resources.splice(0).reverse()) {
+        resource.dispose();
       }
-      disposable.dispose();
     }
-
-    return Promise.resolve();
   }
 }
 
-let client: Client;
+let client: Client | undefined;
+let outputChannel: LogOutputChannel | undefined;
 
 const defaultServerCandidates = [["nixd"], ["nil"]];
 
@@ -87,9 +84,18 @@ function resolveServerPath(): Array<string> {
   return ["nixd"];
 }
 
-export async function activate(context: ExtensionContext): Promise<void> {
+export function getOutputChannel(): LogOutputChannel {
+  outputChannel ??= window.createOutputChannel("Nix", { log: true });
+  return outputChannel;
+}
+
+export async function activate(): Promise<void> {
   if (!config.LSPEnabled) {
     throw new Error("Language server is not enabled in configuration");
+  }
+
+  if (client !== undefined) {
+    return;
   }
 
   const serverPath = resolveServerPath();
@@ -106,8 +112,8 @@ export async function activate(context: ExtensionContext): Promise<void> {
     );
     if (selection?.uri !== undefined) {
       await env.openExternal(selection?.uri);
-      return;
     }
+    throw new Error(`Command ${serverPath} not found in $PATH`);
   }
   const serverExecutable: Executable = {
     command: serverPath[0],
@@ -120,16 +126,17 @@ export async function activate(context: ExtensionContext): Promise<void> {
     { scheme: "untitled", language: "nix" },
   ];
 
-  const outputChannel = window.createOutputChannel("Nix");
+  const logOutputChannel = getOutputChannel();
   const fileEvents = workspace.createFileSystemWatcher("**/*.nix");
 
+  let newClient: Client;
   const clientOptions: LanguageClientOptions = {
     documentSelector: nixDocumentSelector,
     synchronize: {
       fileEvents,
       configurationSection: [config.rootSection],
     },
-    outputChannel,
+    outputChannel: logOutputChannel,
     middleware: {
       workspace: {
         configuration: (params: ConfigurationParams): LSPArray[] => {
@@ -143,7 +150,7 @@ export async function activate(context: ExtensionContext): Promise<void> {
             const sectionSettings =
               settings[item.section as keyof typeof settings];
             if (!sectionSettings) {
-              client.warn(
+              newClient.warn(
                 `failed to find "${item.section}" in "nix.serverSettings"`,
               );
             }
@@ -156,32 +163,20 @@ export async function activate(context: ExtensionContext): Promise<void> {
     },
   };
 
-  client = new Client("nix", "Nix", serverOptions, clientOptions);
-  client.disposables.push(outputChannel, fileEvents);
-  client.registerProposedFeatures();
-  await client.start();
-
-  context.subscriptions.push(client);
+  newClient = new Client("nix", "Nix", serverOptions, clientOptions);
+  newClient.addResources(fileEvents);
+  newClient.registerProposedFeatures();
+  try {
+    await newClient.start();
+    client = newClient;
+  } catch (error) {
+    await newClient.dispose().catch(() => undefined);
+    throw error;
+  }
 }
 
 export async function deactivate(): Promise<void> {
-  if (client?.needsStop()) {
-    await client.stop();
-  }
-  await client.dispose();
-}
-
-export async function restart(context: ExtensionContext): Promise<void> {
-  const restartingMsg = window.setStatusBarMessage(
-    "$(loading~spin) Restarting Nix language server",
-  );
-
-  try {
-    await deactivate();
-    await activate(context);
-  } catch (error) {
-    client?.error("Failed to restart Nix language server", error, "force");
-  } finally {
-    restartingMsg.dispose();
-  }
+  const activeClient = client;
+  client = undefined;
+  await activeClient?.dispose();
 }

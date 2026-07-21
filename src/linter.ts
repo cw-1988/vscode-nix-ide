@@ -1,6 +1,6 @@
 import { sync as commandExistsSync } from "command-exists";
 import * as vscode from "vscode";
-import { Diagnostic, type ExtensionContext, type TextDocument } from "vscode";
+import { Diagnostic, Disposable, type TextDocument } from "vscode";
 import { runInWorkspace } from "./process-runner";
 
 /**
@@ -25,8 +25,6 @@ interface LintErrorType {
   row: number;
   col: number;
 }
-
-let nixDiagnostics: vscode.DiagnosticCollection | null = null;
 
 /**
  * Exec pattern against the given text and return an array of all matches.
@@ -77,7 +75,11 @@ const shellOutputToDiagnostics = (
   return diagnostics;
 };
 
-async function lintDocument(document: TextDocument) {
+async function lintDocument(
+  document: TextDocument,
+  diagnostics: vscode.DiagnosticCollection,
+  isActive: () => boolean,
+) {
   if (!isSavedDocument(document)) {
     return;
   }
@@ -94,50 +96,49 @@ async function lintDocument(document: TextDocument) {
     if (error instanceof Error) {
       await vscode.window.showErrorMessage(error.message);
     }
-    nixDiagnostics?.delete(document.uri);
+    if (isActive()) {
+      diagnostics.delete(document.uri);
+    }
     return;
   }
-  nixDiagnostics?.set(document.uri, d as Diagnostic[]);
+  if (isActive()) {
+    diagnostics.set(document.uri, d as Diagnostic[]);
+  }
 }
 
 /**
  * Start linting files.
  *
- * @param context The extension context
+ * @return A disposable that stops linting and clears its diagnostics
  */
-export async function startLinting(context: ExtensionContext): Promise<void> {
-  if (nixDiagnostics !== null) {
-    // the linter is probably inited already
-    return;
-  }
-  nixDiagnostics = vscode.languages.createDiagnosticCollection("nix");
-  context.subscriptions.push(nixDiagnostics);
+export async function startLinting(): Promise<Disposable> {
+  let active = true;
+  const diagnostics = vscode.languages.createDiagnosticCollection("nix");
+  const subscriptions: Disposable[] = [diagnostics];
+  const lint = (document: TextDocument) =>
+    lintDocument(document, diagnostics, () => active);
 
   // Check if nix-instantiate is available
   if (!commandExistsSync("nix-instantiate")) {
-    await vscode.window.showWarningMessage(
+    void vscode.window.showWarningMessage(
       "nix-instantiate not found in $PATH. Linting is disabled.",
     );
-    return;
+  } else {
+    subscriptions.push(
+      vscode.workspace.onDidOpenTextDocument(lint),
+      vscode.workspace.onDidSaveTextDocument(lint),
+      vscode.workspace.onDidCloseTextDocument((document) =>
+        diagnostics.delete(document.uri),
+      ),
+    );
+    for (const textDocument of vscode.workspace.textDocuments) {
+      await lint(textDocument);
+    }
   }
 
-  vscode.workspace.onDidOpenTextDocument(
-    lintDocument,
-    null,
-    context.subscriptions,
-  );
-  vscode.workspace.onDidSaveTextDocument(
-    lintDocument,
-    null,
-    context.subscriptions,
-  );
-  for await (const textDocument of vscode.workspace.textDocuments) {
-    await lintDocument(textDocument);
-  }
-  // Remove diagnostics for closed files
-  vscode.workspace.onDidCloseTextDocument(
-    (d) => nixDiagnostics?.delete(d.uri),
-    null,
-    context.subscriptions,
-  );
+  const resources = Disposable.from(...subscriptions);
+  return new Disposable(() => {
+    active = false;
+    resources.dispose();
+  });
 }

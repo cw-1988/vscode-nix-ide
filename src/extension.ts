@@ -5,20 +5,73 @@ import { config } from "./configuration";
 import { formattingProviders } from "./formatter";
 import { startLinting } from "./linter";
 
-async function restartLSP(context: ExtensionContext) {
-  if (config.LSPEnabled) {
-    await client.restart(context);
-  } else {
-    await client.activate(context).catch(async () => {
-      await startLinting(context);
-    });
+let fallbackServices: vscode.Disposable | undefined;
+let transition: Promise<void> = Promise.resolve();
+let deactivating = false;
+
+function stopFallbackServices(): void {
+  fallbackServices?.dispose();
+  fallbackServices = undefined;
+}
+
+async function startFallbackServices(): Promise<void> {
+  const linting = await startLinting();
+  try {
+    fallbackServices = vscode.Disposable.from(
+      linting,
+      vscode.languages.registerDocumentFormattingEditProvider(
+        "nix",
+        formattingProviders,
+      ),
+      vscode.languages.registerDocumentRangeFormattingEditProvider(
+        "nix",
+        formattingProviders,
+      ),
+    );
+  } catch (error) {
+    linting.dispose();
+    throw error;
   }
 }
 
-async function onConfigChange(
-  event: vscode.ConfigurationChangeEvent,
-  context: ExtensionContext,
-) {
+async function reconcileServices(): Promise<void> {
+  await client.deactivate();
+  stopFallbackServices();
+
+  if (!config.LSPEnabled) {
+    await startFallbackServices();
+    return;
+  }
+
+  try {
+    await client.activate();
+  } catch (error) {
+    console.error(error);
+    await startFallbackServices();
+  }
+}
+
+function scheduleReconcile(): Promise<void> {
+  if (deactivating) {
+    return Promise.resolve();
+  }
+  const next = transition.then(reconcileServices, reconcileServices);
+  transition = next.catch(() => undefined);
+  return next;
+}
+
+async function restartServices(): Promise<void> {
+  const restartingMessage = vscode.window.setStatusBarMessage(
+    "$(loading~spin) Restarting Nix language services",
+  );
+  try {
+    await scheduleReconcile();
+  } finally {
+    restartingMessage.dispose();
+  }
+}
+
+async function onConfigChange(event: vscode.ConfigurationChangeEvent) {
   if (!config.requiresServerRestart(event)) {
     return;
   }
@@ -27,17 +80,8 @@ async function onConfigChange(
     "Restart",
   );
   if (choice === "Restart") {
-    await restartLSP(context);
+    await restartServices();
   }
-}
-
-async function registerNoLspSubs(context: ExtensionContext) {
-  await startLinting(context);
-  const subs = [
-    vscode.languages.registerDocumentFormattingEditProvider,
-    vscode.languages.registerDocumentRangeFormattingEditProvider,
-  ].map((func) => func("nix", formattingProviders));
-  context.subscriptions.push(...subs);
 }
 
 /**
@@ -53,29 +97,20 @@ async function registerNoLspSubs(context: ExtensionContext) {
  * @return A promise for the initialization
  */
 export async function activate(context: ExtensionContext): Promise<void> {
-  vscode.workspace.onDidChangeConfiguration(async (event) => {
-    await onConfigChange(event, context);
-  });
   context.subscriptions.push(
+    client.getOutputChannel(),
+    vscode.workspace.onDidChangeConfiguration(onConfigChange),
     vscode.commands.registerCommand(
       "nix-ide.restartLanguageServer",
-      restartLSP,
+      restartServices,
     ),
   );
-
-  if (!config.LSPEnabled) {
-    await registerNoLspSubs(context);
-    return;
-  }
-
-  try {
-    await client.activate(context);
-  } catch (err) {
-    console.error(err);
-    await registerNoLspSubs(context);
-  }
+  await scheduleReconcile();
 }
 
 export async function deactivate(): Promise<void> {
+  deactivating = true;
+  await transition;
   await client.deactivate();
+  stopFallbackServices();
 }
