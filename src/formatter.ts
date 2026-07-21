@@ -9,8 +9,6 @@ import {
 import { config } from "./configuration";
 import { type IProcessResult, runInWorkspace } from "./process-runner";
 
-const FORMATTER: Array<string> = config.formatterPath;
-
 /**
  * Get text edits to format a range in a document.
  *
@@ -25,20 +23,29 @@ const getFormatRangeEdits = async (
   const actualRange = document.validateRange(
     range || new Range(0, 0, Number.MAX_VALUE, Number.MAX_VALUE),
   );
+  // Caching the formatter command at module load matched the original service
+  // model: the fallback formatter was registered once and lived until extension
+  // shutdown. Supporting `{file}` made part of that command request-specific,
+  // though, and replacing the token in the cached array turned the template into
+  // the first document's concrete path. Runtime mode changes also allow settings
+  // to change without reloading this module. Configuration therefore remains the
+  // recipe from which each request derives a fresh argv. The external process
+  // dominates the tiny copy cost, while every document sees its own path and
+  // current settings.
+  const formatter = config.formatterPath.map((argument) =>
+    argument.replace("{file}", document.fileName),
+  );
   let result: IProcessResult;
   try {
-    FORMATTER.forEach((elm, i) => {
-      FORMATTER[i] = elm.replace("{file}", document.fileName);
-    });
     result = await runInWorkspace(
       vscode.workspace.getWorkspaceFolder(document.uri),
-      FORMATTER,
+      formatter,
       document.getText(actualRange),
     );
   } catch (error) {
     if (error instanceof Error) {
       await vscode.window.showErrorMessage(
-        `Failed to run ${FORMATTER.join(" ")}: ${error.message}`,
+        `Failed to run ${formatter.join(" ")}: ${error.message}`,
       );
     }
     // Re-throw the error to make the promise fail
